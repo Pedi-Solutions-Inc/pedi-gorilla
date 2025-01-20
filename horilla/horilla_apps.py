@@ -56,4 +56,4 @@ SIDEBARS = [
     "helpdesk",
 ]
 
-WHITE_LABELLING = False
+WHITE_LABELLING = True
