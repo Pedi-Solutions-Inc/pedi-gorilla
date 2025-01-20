@@ -30,7 +30,7 @@ env = environ.Env(
         "django-insecure-j8op9)1q8$1&0^s&p*_0%d#pr@w9qj@1o=3#@d=a(^@9@zd@%j",
     ),
     ALLOWED_HOSTS=(list, ["*"]),
-    CSRF_TRUSTED_ORIGINS=(list, ["http://localhost:8000"]),
+    CSRF_TRUSTED_ORIGINS=(list, ["https://hrms.pedi.ph"]),
 )
 
 env.read_env(os.path.join(BASE_DIR, ".env"), overwrite=True)
@@ -126,7 +126,7 @@ else:
                 "DB_NAME",
                 default=os.path.join(
                     BASE_DIR,
-                    "TestDB_Horilla.sqlite3",
+                    ".pedi/pedi_hrms.sqlite3",
                 ),
             ),
             "USER": env("DB_USER", default=""),
