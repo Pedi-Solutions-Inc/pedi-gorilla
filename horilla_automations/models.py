@@ -31,6 +31,12 @@ class MailAutomation(HorillaModel):
         ("on_update", "On Update"),
         ("on_delete", "On Delete"),
     ]
+    SEND_OPTIONS = [
+        ("email", "Send as Email"),
+        ("notification", "Send as Notification"),
+        ("both", "Send as Email and Notification"),
+    ]
+
     title = models.CharField(max_length=256, unique=True)
     method_title = models.CharField(max_length=50, editable=False)
     model = models.CharField(max_length=100, choices=MODEL_CHOICES, null=False)
@@ -38,18 +44,26 @@ class MailAutomation(HorillaModel):
     mail_details = models.CharField(
         max_length=250,
         help_text=_trans(
-            "Fill mail template details(reciever/instance, `self` will be the person who trigger the automation)"
+            "Fill mail template details(reciever/instance, `self` will be the person who trigger the automation), `As template` option will sent instead of the mail template"
         ),
     )
     mail_detail_choice = models.TextField(default="", editable=False)
     trigger = models.CharField(max_length=10, choices=choices)
     # udpate the on_update logic to if and only if when
     # changes in the previous and current value
-    mail_template = models.ForeignKey(HorillaMailTemplate, on_delete=models.CASCADE)
+    mail_template = models.ForeignKey(
+        HorillaMailTemplate, on_delete=models.CASCADE, null=True, blank=True
+    )
     also_sent_to = models.ManyToManyField(
         Employee,
         blank=True,
         verbose_name=_trans("Also Send to"),
+    )
+    delivary_channel = models.CharField(
+        default="email",
+        max_length=50,
+        choices=SEND_OPTIONS,
+        verbose_name=_trans("Choose Delivary Channel"),
     )
     template_attachments = models.ManyToManyField(
         HorillaMailTemplate,

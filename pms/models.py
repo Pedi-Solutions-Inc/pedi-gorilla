@@ -128,6 +128,7 @@ class Objective(HorillaModel):
         verbose_name=_("Company"),
         on_delete=models.CASCADE,
     )
+    self_employee_progress_update = models.BooleanField(default=True)
     objects = HorillaCompanyManager("employee_id__employee_work_info__company_id")
 
     class Meta:
@@ -497,13 +498,16 @@ class Feedback(HorillaModel):
         ("months", _("Months")),
         ("years", _("Years")),
     )
-    review_cycle = models.CharField(max_length=100, null=False, blank=False)
+    review_cycle = models.CharField(
+        max_length=100, null=False, blank=False, verbose_name=_("Title")
+    )
     manager_id = models.ForeignKey(
         Employee,
         related_name="feedback_manager",
         on_delete=models.DO_NOTHING,
         null=True,
-        blank=False,
+        blank=True,
+        verbose_name=_("Manager"),
     )
     employee_id = models.ForeignKey(
         Employee,
@@ -511,12 +515,25 @@ class Feedback(HorillaModel):
         related_name="feedback_employee",
         null=False,
         blank=False,
+        verbose_name=_("Employee"),
     )
     colleague_id = models.ManyToManyField(
-        Employee, related_name="feedback_colleague", blank=True
+        Employee,
+        related_name="feedback_colleague",
+        blank=True,
+        verbose_name=_("Colleague"),
     )
     subordinate_id = models.ManyToManyField(
-        Employee, related_name="feedback_subordinate", blank=True
+        Employee,
+        related_name="feedback_subordinate",
+        blank=True,
+        verbose_name=_("Subordinates"),
+    )
+    others_id = models.ManyToManyField(
+        Employee,
+        related_name="feedback_others",
+        blank=True,
+        verbose_name=_("Employees"),
     )
     question_template_id = models.ForeignKey(
         QuestionTemplate,
@@ -524,19 +541,23 @@ class Feedback(HorillaModel):
         related_name="feedback_question_template",
         null=False,
         blank=False,
+        verbose_name=_("Question Template"),
     )
     status = models.CharField(
         max_length=50, choices=STATUS_CHOICES, default="Not Started"
     )
     archive = models.BooleanField(null=True, blank=True, default=False)
-    start_date = models.DateField(null=False, blank=False)
-    end_date = models.DateField(null=True, blank=False)
+    start_date = models.DateField(null=False, blank=False, verbose_name=_("Start Date"))
+    end_date = models.DateField(null=True, blank=False, verbose_name=_("End Date"))
     employee_key_results_id = models.ManyToManyField(
-        EmployeeKeyResult,
-        blank=True,
+        EmployeeKeyResult, blank=True, verbose_name=_("Key Result")
     )
-    cyclic_feedback = models.BooleanField(default=False)
-    cyclic_feedback_days_count = models.IntegerField(blank=True, null=True)
+    cyclic_feedback = models.BooleanField(
+        default=False, verbose_name=_("Is Cyclic Feedback")
+    )
+    cyclic_feedback_days_count = models.IntegerField(
+        blank=True, null=True, verbose_name=_("Cycle Period")
+    )
     cyclic_feedback_period = models.CharField(
         max_length=50, choices=PERIOD, blank=True, null=True
     )
@@ -547,6 +568,8 @@ class Feedback(HorillaModel):
 
     class Meta:
         ordering = ["-id"]
+        verbose_name = _("Feedback")
+        verbose_name_plural = _("Feedbacks")
 
     def save(self, *args, **kwargs):
         start_date = self.start_date
@@ -582,24 +605,14 @@ class Feedback(HorillaModel):
         return f"{self.employee_id.employee_first_name} - {self.review_cycle}"
 
     def requested_employees(self):
-        manager = self.manager_id
-        colleagues = self.colleague_id.all()
-        subordinates = self.subordinate_id.all()
-        owner = self.employee_id
-
-        employees = [employee for employee in subordinates]
-
-        for employee in colleagues:
-            if employee not in employees:
-                employees.append(employee)
-
-        if manager not in employees:
-            employees.append(manager)
-
-        if owner not in employees:
-            employees.append(owner)
-
-        return employees
+        employees = set(self.subordinate_id.all())
+        employees.update(self.colleague_id.all())
+        employees.update(self.others_id.all())
+        if self.manager_id:
+            employees.add(self.manager_id)
+        if self.employee_id:
+            employees.add(self.employee_id)
+        return list(employees)
 
 
 class AnonymousFeedback(models.Model):

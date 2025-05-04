@@ -454,7 +454,7 @@ def calculate_tax_deduction(*_args, **kwargs):
         deductions.exclude(one_time_date__lt=start_date)
         .exclude(one_time_date__gt=end_date)
         .exclude(update_compensation__isnull=False)
-    )
+    ).distinct()
     deductions_amt = []
     serialized_deductions = []
     for deduction in deductions:
@@ -515,14 +515,16 @@ def calculate_pre_tax_deduction(*_args, **kwargs):
         include_active_employees=True, is_pretax=True, is_tax=False
     ).exclude(exclude_employees=employee)
 
-    deductions = specific_deductions | conditional_deduction | active_employee_deduction
+    deductions = (
+        specific_deductions | conditional_deduction | active_employee_deduction
+    ).distinct()
     deductions = (
         deductions.exclude(one_time_date__lt=start_date)
         .exclude(one_time_date__gt=end_date)
         .exclude(update_compensation__isnull=False)
     )
     # Installment deductions
-    installments = deductions.filter(is_installment=True)
+    installments = deductions.filter(is_installment=True).distinct()
 
     pre_tax_deductions = []
     pre_tax_deductions_amt = []
@@ -622,14 +624,16 @@ def calculate_post_tax_deduction(*_args, **kwargs):
     active_employee_deduction = models.Deduction.objects.filter(
         include_active_employees=True, is_pretax=False, is_tax=False
     ).exclude(exclude_employees=employee)
-    deductions = specific_deductions | conditional_deduction | active_employee_deduction
+    deductions = (
+        specific_deductions | conditional_deduction | active_employee_deduction
+    ).distinct()
     deductions = (
         deductions.exclude(one_time_date__lt=start_date)
         .exclude(one_time_date__gt=end_date)
         .exclude(update_compensation__isnull=False)
     )
     # Installment deductions
-    installments = deductions.filter(is_installment=True)
+    installments = deductions.filter(is_installment=True).distinct()
 
     post_tax_deductions = []
     post_tax_deductions_amt = []
@@ -813,9 +817,11 @@ def calculate_based_on_gross_pay(*_args, **kwargs):
     """
 
     component = kwargs["component"]
+    day_dict = kwargs["day_dict"]
     gross_pay = calculate_gross_pay(**kwargs)
     rate = component.rate
     amount = gross_pay["gross_pay"] * rate / 100
+    amount = compute_limit(component, amount,day_dict)
     return amount
 
 
@@ -836,10 +842,12 @@ def calculate_based_on_taxable_gross_pay(*_args, **kwargs):
 
     """
     component = kwargs["component"]
+    day_dict = kwargs["day_dict"]
     taxable_gross_pay = calculate_taxable_gross_pay(**kwargs)
     taxable_gross_pay = taxable_gross_pay["taxable_gross_pay"]
     rate = component.rate
     amount = taxable_gross_pay * rate / 100
+    amount = compute_limit(component, amount,day_dict)
     return amount
 
 
@@ -857,8 +865,6 @@ def calculate_based_on_net_pay(component, net_pay, day_dict):
     """
     rate = float(component.rate)
     amount = net_pay * rate / 100
-    amount = compute_limit(component, amount, day_dict)
-
     amount = compute_limit(component, amount, day_dict)
     return amount
 
@@ -894,9 +900,7 @@ def calculate_based_on_attendance(*_args, **kwargs):
         attendance_validated=True,
     ).count()
     amount = count * component.per_attendance_fixed_amount
-
     amount = compute_limit(component, amount, day_dict)
-
     return amount
 
 

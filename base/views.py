@@ -236,28 +236,31 @@ def load_demo_database(request):
                     "base_data.json",
                     "work_info_data.json",
                 ]
-                optional_apps = {
-                    "attendance": "attendance_data.json",
-                    "leave": "leave_data.json",
-                    "asset": "asset_data.json",
-                    "recruitment": "recruitment_data.json",
-                    "onboarding": "onboarding_data.json",
-                    "offboarding": "offboarding_data.json",
-                    "pms": "pms_data.json",
-                    "payroll": "payroll_data.json",
-                }
+                optional_apps = [
+                    ("attendance", "attendance_data.json"),
+                    ("leave", "leave_data.json"),
+                    ("asset", "asset_data.json"),
+                    ("recruitment", "recruitment_data.json"),
+                    ("onboarding", "onboarding_data.json"),
+                    ("offboarding", "offboarding_data.json"),
+                    ("pms", "pms_data.json"),
+                    ("payroll", "payroll_data.json"),
+                    ("payroll", "payroll_loanaccount_data.json"),
+                    ("project", "project_data.json"),
+                ]
 
                 # Add data files for installed apps
                 data_files += [
-                    file
-                    for app, file in optional_apps.items()
-                    if apps.is_installed(app)
+                    file for app, file in optional_apps if apps.is_installed(app)
                 ]
 
                 # Load all data files
                 for file in data_files:
                     file_path = path.join(settings.BASE_DIR, "load_data", file)
-                    call_command("loaddata", file_path)
+                    try:
+                        call_command("loaddata", file_path)
+                    except Exception as e:
+                        messages.error(request, f"An error occured : {e}")
 
                 messages.success(request, _("Database loaded successfully."))
             else:
@@ -1650,9 +1653,12 @@ def company_view(request):
     """
     This method used to view created companies
     """
-
     companies = Company.objects.all()
-    return render(request, "base/company/company.html", {"companies": companies})
+    return render(
+        request,
+        "base/company/company.html",
+        {"companies": companies, "model": Company()},
+    )
 
 
 @login_required
@@ -3290,33 +3296,31 @@ def employee_permission_assign(request):
 
     context = {}
     template = "base/auth/permission.html"
-    if request.GET.get("profile_tab"):
+    if request.GET.get("profile_tab") and request.GET.get("employee_id"):
         template = "tabs/group_permissions.html"
-        employees = Employee.objects.filter(id=request.GET["employee_id"]).distinct()
-        emoloyee = employees.first()
-        context["employee"] = emoloyee
+        employees = Employee.objects.filter(id=request.GET["employee_id"])
+        context["employee"] = employees.first()
     else:
         employees = Employee.objects.filter(
             employee_user_id__user_permissions__isnull=False
         ).distinct()
         context["show_assign"] = True
-    permissions = []
-    no_permission_models = NO_PERMISSION_MODALS
-    for app_name in APPS:
-        app_models = []
-        for model in get_models_in_app(app_name):
-            if model._meta.model_name not in no_permission_models:
-                app_models.append(
-                    {
-                        "verbose_name": model._meta.verbose_name.capitalize(),
-                        "model_name": model._meta.model_name,
-                    }
-                )
-        permissions.append(
-            {"app": app_name.capitalize().replace("_", " "), "app_models": app_models}
-        )
+    permissions = [
+        {
+            "app": app_name.capitalize().replace("_", " "),
+            "app_models": [
+                {
+                    "verbose_name": model._meta.verbose_name.capitalize(),
+                    "model_name": model._meta.model_name,
+                }
+                for model in get_models_in_app(app_name)
+                if model._meta.model_name not in NO_PERMISSION_MODALS
+            ],
+        }
+        for app_name in APPS
+    ]
     context["permissions"] = permissions
-    context["no_permission_models"] = no_permission_models
+    context["no_permission_models"] = NO_PERMISSION_MODALS
     context["employees"] = paginator_qry(employees, request.GET.get("page"))
     return render(
         request,
@@ -3335,26 +3339,29 @@ def employee_permission_search(request, codename=None, uid=None):
     template = "base/auth/permission_lines.html"
     employees = EmployeeFilter(request.GET).qs
     if request.GET.get("profile_tab"):
-        template = "base/auth/permission_accordion.html"
-        employees = employees.filter(id=request.GET["employee_id"]).distinct()
+        employees = Employee.objects.filter(id=request.GET["employee_id"])
+        context["employee"] = employees.first()
     else:
         employees = employees.filter(
             employee_user_id__user_permissions__isnull=False
         ).distinct()
         context["show_assign"] = True
-    permissions = []
-    apps = APPS
-    for app_name in apps:
-        app_models = []
-        for model in get_models_in_app(app_name):
-            app_models.append(
+    permissions = [
+        {
+            "app": app_name.capitalize().replace("_", " "),
+            "app_models": [
                 {
                     "verbose_name": model._meta.verbose_name.capitalize(),
                     "model_name": model._meta.model_name,
                 }
-            )
-        permissions.append({"app": app_name.capitalize(), "app_models": app_models})
+                for model in get_models_in_app(app_name)
+                if model._meta.model_name not in NO_PERMISSION_MODALS
+            ],
+        }
+        for app_name in APPS
+    ]
     context["permissions"] = permissions
+    context["no_permission_models"] = NO_PERMISSION_MODALS
     context["employees"] = paginator_qry(employees, request.GET.get("page"))
     return render(
         request,
@@ -3877,7 +3884,7 @@ def work_type_request_update(request, work_type_request_id):
     if request.method == "POST":
         response = render(
             request,
-            "work_type_request/request_update_form.html",
+            "work_type_request/request_form.html",
             {
                 "form": form,
             },
@@ -3892,7 +3899,7 @@ def work_type_request_update(request, work_type_request_id):
                 response.content.decode("utf-8") + "<script>location.reload();</script>"
             )
 
-    return render(request, "work_type_request/request_update_form.html", {"form": form})
+    return render(request, "work_type_request/request_form.html", {"form": form})
 
 
 @login_required
@@ -5403,6 +5410,12 @@ def enable_profile_edit_feature(request):
             DefaultAccessibility.objects.create(
                 feature="profile_edit", filter={"feature": ["profile_edit"]}
             )
+        else:
+            if feature is not None:
+                feature.delete()
+                messages.info(
+                    request, _("Profile edit accessibility feature has been removed.")
+                )
 
         if enabled:
             if not any(item[0] == "profile_edit" for item in ACCESSBILITY_FEATURE):
@@ -6752,7 +6765,8 @@ def generate_error_report(error_list, error_data, file_name):
     path_info = f"error-sheet-{uuid.uuid4()}"
     urlpatterns.append(path(path_info, get_error_sheet, name=path_info))
     DYNAMIC_URL_PATTERNS.append(path_info)
-
+    for key in error_data:
+        error_data[key] = []
     return path_info
 
 
@@ -6763,11 +6777,9 @@ def get_upcoming_holidays(request):
     Retrieve and display a list of upcoming holidays for the current month and year.
     """
     today = timezone.localdate()
-    current_month = today.month
     current_year = today.year
     holidays = Holidays.objects.filter(
-        Q(start_date__month=current_month, start_date__year=current_year)
-        & Q(start_date__gte=today)
+        start_date__year=current_year, start_date__gte=today
     )
     colors = generate_colors(len(holidays))
     for i, holiday in enumerate(holidays):

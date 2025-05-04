@@ -28,11 +28,14 @@ from django.utils.translation import gettext_lazy as _
 from base.methods import (
     closest_numbers,
     eval_validate,
+    filtersubordinatesemployeemodel,
     get_key_instances,
     get_pagination,
+    is_reportingmanager,
     paginator_qry,
     sortby,
 )
+from base.models import Company
 from employee.models import Employee, EmployeeWorkInformation
 from horilla.decorators import (
     hx_request_required,
@@ -74,6 +77,7 @@ from pms.forms import (
     QuestionTemplateForm,
 )
 from pms.methods import (
+    check_duplication,
     check_permission_feedback_detailed_view,
     get_anonymous_feedbacks,
     pms_owner_and_manager_can_enter,
@@ -160,7 +164,7 @@ def obj_form_save(request, objective_form):
 
 
 @login_required
-@manager_can_enter(perm="pms.add_employeeobjective")
+@permission_required(perm="pms.add_employeeobjective")
 def objective_creation(request):
     """
     This view is for objective creation , and returns a objective form.
@@ -275,7 +279,7 @@ def objective_update(request, obj_id):
 
 # key result
 @login_required
-@manager_can_enter("pms.view_keyresult")
+@permission_required("pms.view_keyresult")
 def view_key_result(request):
     """
     This method is used render template to view all the key result instances
@@ -294,7 +298,7 @@ def view_key_result(request):
 
 @login_required
 @hx_request_required
-@permission_required("pms.view_key_result")
+# @permission_required("pms.view_key_result")
 def filter_key_result(request):
     """
     Filter and retrieve a list of key results based on the provided query parameters.
@@ -589,13 +593,25 @@ def objective_filter_pagination(request, objective_own):
     employee = request.user.employee_get
     manager = False
 
-    objectives = (
-        Objective.objects.filter(Q(managers=employee) | Q(assignees=employee))
+    sub_employees = filtersubordinatesemployeemodel(
+        request,
+        queryset=Employee.objects.filter(is_active=True),
+    )
+    sub_obj_ids = (
+        EmployeeObjective.objects.filter(employee_id__in=sub_employees)
+        .values_list("objective_id", flat=True)
+        .distinct()
+    )
+
+    objectives = Objective.objects.filter(
+        Q(managers=employee) | Q(assignees=employee) | Q(id__in=sub_obj_ids)
     ).distinct()
     if request.user.has_perm("pms.view_objective"):
         objectives = Objective.objects.all()
         manager = True
-    elif Objective.objects.filter(managers=employee).exists():
+    elif Objective.objects.filter(managers=employee).exists() or is_reportingmanager(
+        request
+    ):
         manager = True
     objectives = ActualObjectiveFilter(
         request.GET or initial_data, queryset=objectives
@@ -1053,7 +1069,7 @@ def create_employee_objective(request):
             obj = emp_obj.objective_id
             # Add this employee as assignee
             obj.assignees.add(emp_obj.employee_id)
-            krs.extend([key_result for key_result in obj.key_result_id.all()])
+            # krs.extend([key_result for key_result in obj.key_result_id.all()])
             set_krs = set(krs)
             emp_obj.save()
             # Add all key results
@@ -1071,6 +1087,18 @@ def create_employee_objective(request):
                     )
             messages.success(request, _("Employee objective created successfully"))
             return HttpResponse("<script>window.location.reload()</script>")
+    context = {"form": form, "k_form": KRForm(), "emp_obj": True}
+    return render(
+        request, "okr/emp_objective/emp_objective_create_form.html", context=context
+    )
+
+
+@login_required
+def get_objective_keyresults(request):
+    obj_id = request.GET.get("objective_id")
+    objective = Objective.objects.filter(id=obj_id).first()
+    keyresults = objective.key_result_id.all()
+    form = EmployeeObjectiveCreateForm(initial={"key_result_id": keyresults})
     context = {"form": form, "k_form": KRForm(), "emp_obj": True}
     return render(
         request, "okr/emp_objective/emp_objective_create_form.html", context=context
@@ -1533,7 +1561,7 @@ def feedback_creation(request):
 
 @login_required
 @hx_request_required
-@manager_can_enter(perm="pms.change_feedback")
+@permission_required(perm="pms.change_feedback")
 def feedback_update(request, id):
     """
     This view is used to  update the feedback.
@@ -1565,8 +1593,12 @@ def feedback_update(request, id):
                     ).first()
                     feedback_form = form.save()
                     feedback_form.employee_key_results_id.add(key_result)
-            instance = form.save()
+            instance = form.save(commit=False)
             instance.subordinate_id.set(employees)
+            other_employees = check_duplication(
+                form.instance, form.instance.others_id.all()
+            )
+            form.cleaned_data["others_id"] = other_employees
             form = form.save()
             messages.info(request, _("Feedback updated successfully!."))
             send_feedback_notifications(request, form)
@@ -1662,6 +1694,9 @@ def feedback_list_search(request):
     requested_feedback_ids.extend(
         [i.id for i in Feedback.objects.filter(subordinate_id=employee_id)]
     )
+    requested_feedback_ids.extend(
+        [i.id for i in Feedback.objects.filter(others_id=employee_id)]
+    )
     requested_feedback = Feedback.objects.filter(
         pk__in=requested_feedback_ids,
         review_cycle__icontains=feedback,
@@ -1711,7 +1746,10 @@ def feedback_list_view(request):
     )
     # feedbacks to answer
     feedback_requested = Feedback.objects.filter(
-        Q(manager_id=employee) | Q(colleague_id=employee) | Q(subordinate_id=employee),
+        Q(manager_id=employee)
+        | Q(colleague_id=employee)
+        | Q(subordinate_id=employee)
+        | Q(others_id=employee),
         start_date__lte=datetime.date.today(),
         end_date__gte=datetime.date.today(),
     ).distinct()
@@ -1854,6 +1892,7 @@ def feedback_answer_get(request, id, **kwargs):
         + [feedback.manager_id]
         + list(feedback.colleague_id.all())
         + list(feedback.subordinate_id.all())
+        + list(feedback.others_id.all())
     )
     if not employee in feedback_employees:
         messages.info(request, _("You are not allowed to answer"))
@@ -1958,7 +1997,7 @@ def feedback_answer_view(request, id, **kwargs):
 
 
 @login_required
-@manager_can_enter(perm="pms.delete_feedback")
+@permission_required(perm="pms.delete_feedback")
 def feedback_delete(request, id):
     """
     This view is used to  delete the feedback.
@@ -2101,50 +2140,49 @@ def get_collegues(request):
     try:
         employee_id = request.GET.get("employee_id")
         employee = Employee.objects.get(id=int(employee_id)) if employee_id else None
-
-        if employee:
-            employees_queryset = Employee.objects.none()
-            reporting_manager = (
-                employee.employee_work_info.reporting_manager_id
-                if employee.employee_work_info
-                else None
+        employees_queryset = Employee.objects.none()
+        reporting_manager = (
+            employee.employee_work_info.reporting_manager_id
+            if employee and employee.employee_work_info
+            else None
+        )
+        if request.GET.get("data") == "keyresults":
+            employees_queryset = EmployeeKeyResult.objects.filter(
+                employee_objective_id__employee_id=employee
             )
-
-            if request.GET.get("data") == "colleagues":
-                department = employee.get_department()
-                # employee ids to exclude from collegue list
-                exclude_ids = [employee.id]
-                if reporting_manager:
-                    exclude_ids.append(reporting_manager.id)
-
-                # Get employees in the same department as the employee
-                employees_queryset = Employee.objects.filter(
-                    is_active=True, employee_work_info__department_id=department
-                ).exclude(id__in=exclude_ids)
-            elif request.GET.get("data") == "manager":
-                if reporting_manager:
-                    employees_queryset = Employee.objects.filter(
-                        id=reporting_manager.id
-                    )
-            elif request.GET.get("data") == "subordinates":
-                employees_queryset = Employee.objects.filter(
-                    is_active=True, employee_work_info__reporting_manager_id=employee
-                )
-            elif request.GET.get("data") == "keyresults":
-                employees_queryset = EmployeeKeyResult.objects.filter(
-                    employee_objective_id__employee_id=employee
-                ).values_list("id", "key_result_id__title")
-            # Convert QuerySets to a list
-            employees = [(employee.id, employee) for employee in employees_queryset]
-            context = {"employees": employees}
-            employee_html = render_to_string("employee/employees_select.html", context)
-            return HttpResponse(employee_html)
         else:
-            return JsonResponse({"error": "Employee not found"}, status=404)
-    except Employee.DoesNotExist:
-        return JsonResponse({"error": "Invalid Employee ID"}, status=400)
-    except Exception as e:
-        return JsonResponse({"error": str(e)}, status=500)
+            if employee and employee.employee_work_info:
+                if request.GET.get("data") == "colleagues":
+                    department = employee.get_department()
+                    # employee ids to exclude from collegue list
+                    exclude_ids = [employee.id]
+                    if reporting_manager:
+                        exclude_ids.append(reporting_manager.id)
+
+                    # Get employees in the same department as the employee
+                    employees_queryset = Employee.objects.filter(
+                        is_active=True, employee_work_info__department_id=department
+                    ).exclude(id__in=exclude_ids)
+                elif request.GET.get("data") == "manager":
+                    if reporting_manager:
+                        employees_queryset = Employee.objects.filter(
+                            id=reporting_manager.id
+                        )
+                elif request.GET.get("data") == "subordinates":
+                    employees_queryset = Employee.objects.filter(
+                        is_active=True,
+                        employee_work_info__reporting_manager_id=employee,
+                    )
+
+        # Convert QuerySets to a list
+        employees = [(employee.id, employee) for employee in employees_queryset]
+        context = {"employees": employees}
+        employee_html = render_to_string("employee/employees_select.html", context)
+        return HttpResponse(employee_html)
+    except:
+        context = {"employees": []}
+        employee_html = render_to_string("employee/employees_select.html", context)
+        return HttpResponse(employee_html)
 
 
 @login_required
@@ -2323,19 +2361,20 @@ def question_delete(request, id):
         QuestionOptions.objects.filter(question_id=question).delete()
         question.delete()
         messages.success(request, _("Question deleted successfully!"))
-        return redirect(question_template_detailed_view, temp_id)
-
-    except IntegrityError:
-        # Code to handle the FOREIGN KEY constraint failed error
-        messages.error(
-            request, _("Failed to delete question: Question template is in use.")
-        )
+        return HttpResponse("<script>reloadMessage();</script>")
 
     except Question.DoesNotExist:
         messages.error(request, _("Question not found."))
+    except IntegrityError:
+        messages.error(
+            request, _("Failed to delete question: Question template is in use.")
+        )
     except ProtectedError:
-        messages.error(request, _("Related entries exists"))
-    return redirect(question_template_detailed_view, temp_id)
+        messages.error(request, _("Related entries exist."))
+    except Exception as e:
+        messages.error(request, _(f"Unexpected error: {str(e)}"))
+
+    return HttpResponse("<script>window.location.reload();</script>")
 
 
 @login_required
@@ -2351,20 +2390,13 @@ def question_template_creation(request):
     if request.method == "POST":
         form = QuestionTemplateForm(request.POST)
         if form.is_valid():
-            instance = form.save()
-            return redirect(question_template_detailed_view, instance.id)
-        else:
-            messages.error(
-                request,
-                "\n".join(
-                    [
-                        f"{field}: {error}"
-                        for field, errors in form.errors.items()
-                        for error in errors
-                    ]
-                ),
-            )
-            return redirect(question_template_view)
+            form.save()
+            messages.success(request, _("Question template created successfully!"))
+    return render(
+        request,
+        "feedback/question_template/question_template_form.html",
+        {"form": form},
+    )
 
 
 @login_required
@@ -2446,17 +2478,16 @@ def question_template_update(request, template_id):
 
     """
     question_template = QuestionTemplate.objects.filter(id=template_id).first()
-    question_update_form = QuestionTemplateForm(instance=question_template)
-    context = {"question_update_form": question_update_form}
+    form = QuestionTemplateForm(instance=question_template)
+    context = {"form": form}
     if request.method == "POST":
         form = QuestionTemplateForm(request.POST, instance=question_template)
         if form.is_valid():
             form.save()
-            messages.info(request, _("Question template updated"))
-            # return redirect(question_template_view)
-        context["question_update_form"] = form
+            messages.success(request, _("Question template updated"))
+        context["form"] = form
     return render(
-        request, "feedback/question_template/question_template_update.html", context
+        request, "feedback/question_template/question_template_form.html", context
     )
 
 
@@ -2740,11 +2771,19 @@ def create_period(request):
     This is an ajax method to return json response to create stage related
     to the project in the task-all form fields
     """
+    company_id = request.session.get("selected_company")
+    companies = (
+        Company.objects.filter(id=company_id)
+        if company_id != "all"
+        else Company.objects.all()
+    )
 
     if request.method == "GET":
-        form = PeriodForm()
+        form = PeriodForm(initial={"company_id": companies})
     if request.method == "POST":
-        form = PeriodForm(request.POST)
+        data = request.POST.copy()
+        data.setlist("company_id", list(companies.values_list("id", flat=True)))
+        form = PeriodForm(data)
         if form.is_valid():
             instance = form.save()
             return JsonResponse(

@@ -36,12 +36,9 @@
                 name="search"
                 placeholder="Search in FAQs..."
                 hx-get="{% url 'faq-search' %}?category=true"
-                hx-trigger="change delay:300ms"
-                onkeyup='$("#suggestion_box").show(); if ($(this).val() == "") {$("#suggestion_box").hide()}'
-				onfocusout = '$("#suggestion_box").fadeOut(500)'
+                hx-trigger="change"
                 hx-target="#faqCategoryList"
             />
-            <div class="oh-autocomplete-suggestions" id="suggestion_box"></div>
         </div>
         {% comment %}
         <select class="oh-select oh-select-faq oh-select--dropdown">

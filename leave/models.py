@@ -2,24 +2,19 @@ import calendar
 import logging
 import math
 import operator
-import threading
 from datetime import date, datetime, timedelta
 
 from dateutil.relativedelta import relativedelta
 from django.apps import apps
-from django.conf import settings
 from django.contrib import messages
 from django.core.exceptions import ValidationError
 from django.core.files.storage import default_storage
 from django.db import models
-from django.db.models import Q
-from django.db.models.signals import post_save, pre_save
-from django.dispatch import receiver
+from django.db.models import Q, Sum
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
 from base.horilla_company_manager import HorillaCompanyManager
-from base.methods import get_date_range
 from base.models import (
     Company,
     CompanyLeaves,
@@ -31,12 +26,14 @@ from base.models import (
 )
 from employee.models import Employee, EmployeeWorkInformation
 from horilla import horilla_middlewares
-from horilla.methods import get_horilla_model_class
 from horilla.models import HorillaModel
 from horilla_audit.methods import get_diff
 from horilla_audit.models import HorillaAuditInfo, HorillaAuditLog
-from leave.methods import calculate_requested_days
-from leave.threading import LeaveClashThread
+from leave.methods import (
+    calculate_requested_days,
+    company_leave_dates_list,
+    holiday_dates_list,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -303,6 +300,8 @@ class LeaveType(HorillaModel):
             self.carryforward_expire_date = self.set_expired_date(
                 assigned_date=self.created_at
             )
+        elif self.carryforward_type != "carryforward expire":
+            self.carryforward_expire_date = None
 
         super().save()
 
@@ -339,9 +338,6 @@ class CompanyLeave(HorillaModel):
 
     def __str__(self):
         return f"{dict(WEEK_DAYS).get(self.based_on_week_day)} | {dict(WEEKS).get(self.based_on_week)}"
-
-
-from django.db.models import Sum
 
 
 class AvailableLeave(HorillaModel):
@@ -490,24 +486,31 @@ class AvailableLeave(HorillaModel):
         available_leave.available_days = available_leave.leave_type_id.total_days
         return expired_date
 
-    def save(self, *args, **kwargs):
-        # if self.assigned_date == datetime.now().date() or self.assigned_date.date() == datetime.now().date():
-        if self.reset_date is None:
-            # Check whether the reset is enabled
-            if self.leave_type_id.reset:
-                reset_date = self.set_reset_date(
-                    assigned_date=self.assigned_date, available_leave=self
-                )
-                self.reset_date = reset_date
-            # assigning expire date
+    def pre_save_processing(self):
+        """
+        Reusable method to compute fields normally set in save().
+        """
+        # Logic for reset_date
+        if self.reset_date is None and self.leave_type_id.reset:
+            self.reset_date = self.set_reset_date(
+                assigned_date=self.assigned_date, available_leave=self
+            )
+
+        # Logic for expired_date
         if self.leave_type_id.carryforward_type == "carryforward expire":
             expiry_date = self.assigned_date
             if self.leave_type_id.carryforward_expire_date:
                 expiry_date = self.leave_type_id.carryforward_expire_date
             self.expired_date = expiry_date
 
-        self.total_leave_days = max(self.available_days + self.carryforward_days, 0)
-        self.carryforward_days = max(self.carryforward_days, 0)
+        # Compute total_leave_days and ensure carryforward_days >= 0
+        self.total_leave_days = round(
+            max(self.available_days + self.carryforward_days, 0), 3
+        )
+        self.carryforward_days = round(max(self.carryforward_days, 0), 3)
+
+    def save(self, *args, **kwargs):
+        self.pre_save_processing()
         super().save(*args, **kwargs)
 
 
@@ -523,6 +526,47 @@ def restrict_leaves(restri):
             date = restrict_start_date + timedelta(i)
             restricted_dates.append(date)
     return restricted_dates
+
+
+def leave_requested_dates(start_date, end_date):
+    """
+    Returns a list of dates from the start date to the end date.
+    """
+    if end_date is None:
+        end_date = start_date
+    return [start_date + timedelta(i) for i in range((end_date - start_date).days + 1)]
+
+
+def cal_effective_requested_days(start_date, end_date, leave_type_id, requested_days):
+    """
+    Calculates the effective requested leave days by accounting for
+    holidays and company leave days.
+    """
+    requested_dates = leave_requested_dates(start_date, end_date)
+    holidays = set(holiday_dates_list(Holidays.objects.all()))
+    company_leave_dates = set(
+        company_leave_dates_list(CompanyLeaves.objects.all(), start_date)
+    )
+
+    if (
+        leave_type_id.exclude_company_leave == "yes"
+        and leave_type_id.exclude_holiday == "yes"
+    ):
+        total_leaves = holidays.union(company_leave_dates)
+        total_leave_count = sum(date in total_leaves for date in requested_dates)
+        return requested_days - total_leave_count
+
+    if leave_type_id.exclude_holiday == "yes":
+        holiday_count = sum(date in holidays for date in requested_dates)
+        requested_days -= holiday_count
+
+    if leave_type_id.exclude_company_leave == "yes":
+        company_leave_count = sum(
+            date in company_leave_dates for date in requested_dates
+        )
+        requested_days -= company_leave_count
+
+    return requested_days
 
 
 class LeaveRequest(HorillaModel):
@@ -593,6 +637,8 @@ class LeaveRequest(HorillaModel):
 
     class Meta:
         ordering = ["-id"]
+        verbose_name = "Leave Request"
+        verbose_name_plural = "Leave Requests"
 
     def tracking(self):
         return get_diff(self)
@@ -707,6 +753,31 @@ class LeaveRequest(HorillaModel):
                                 company_leave_dates.append(date)
         return company_leave_dates
 
+    def leaveoverlapping(self):
+        """
+        Checks for overlapping leave requests based on the current instance's dates and employee.
+        """
+        overlapping_requests = LeaveRequest.objects.filter(
+            employee_id=self.employee_id,
+            start_date__lte=self.end_date,
+            end_date__gte=self.start_date,
+        ).exclude(id=self.id)
+
+        if overlapping_requests.exists():
+            existing_leave = overlapping_requests.first()
+
+            # Handle specific start_date_breakdown and end_date_breakdown mismatch
+            if (
+                existing_leave.start_date == self.start_date
+                and existing_leave.start_date_breakdown != "full_day"
+                and self.start_date_breakdown != "full_day"
+                and existing_leave.start_date_breakdown != self.start_date_breakdown
+                and existing_leave.end_date_breakdown != self.end_date_breakdown
+            ):
+                return LeaveRequest.objects.none()
+
+        return overlapping_requests
+
     def save(self, *args, **kwargs):
 
         self.requested_days = calculate_requested_days(
@@ -764,75 +835,162 @@ class LeaveRequest(HorillaModel):
             sequence = 0
             managers = applicable_condition.approval_managers()
             for manager in managers:
-                sequence += 1
                 if not isinstance(manager, Employee):
                     manager = getattr(self.employee_id.employee_work_info, manager)
-                LeaveRequestConditionApproval.objects.create(
-                    sequence=sequence,
-                    leave_request_id=self,
-                    manager_id=manager,
-                )
+                if manager:
+                    sequence += 1
+                    LeaveRequestConditionApproval.objects.create(
+                        sequence=sequence,
+                        leave_request_id=self,
+                        manager_id=manager,
+                    )
 
     def clean(self):
+
         cleaned_data = super().clean()
-        restricted_leave = RestrictLeave.objects.all()
-        leave_type_instance = LeaveType.objects.get(id=self.leave_type_id.id)
 
-        work_info = EmployeeWorkInformation.objects.filter(employee_id=self.employee_id)
-        if work_info.exists():
-            emp_dep = self.employee_id.employee_work_info.department_id
-            emp_job = self.employee_id.employee_work_info.job_position_id
-
+        attachment = self.attachment
+        leave_type = self.leave_type_id
+        requ_days = set(self.requested_dates())
+        restricted_leaves = RestrictLeave.objects.all()
         request = getattr(horilla_middlewares._thread_locals, "request", None)
-        if not request.user.is_superuser:
-            if EmployeePastLeaveRestrict.objects.first().enabled:
-                if self.start_date < date.today():
-                    raise ValidationError(_("Requests cannot be made for past dates."))
-        if not request.user.is_superuser:
 
-            for restrict in restricted_leave:
-                restri = restrict.id
-                requ_days = self.requested_dates()
+        # Check if leave type is assigned to employee
+        if not AvailableLeave.objects.filter(
+            employee_id=self.employee_id, leave_type_id=leave_type
+        ).exists():
+            raise ValidationError(
+                {
+                    "leave_type_id": _(
+                        "The selected leave type is not assigned to this employee."
+                    )
+                }
+            )
 
-                restri_days = []
+        # Date validations
+        if self.start_date > self.end_date:
+            raise ValidationError(_("End date should not be less than start date."))
 
+        if (
+            self.start_date == self.end_date
+            and self.start_date_breakdown != self.end_date_breakdown
+        ):
+            raise ValidationError(
+                _("Mismatch in the breakdown of the start and end date.")
+            )
+
+        # Attachment requirement
+        if leave_type and leave_type.require_attachment == "yes" and not attachment:
+            raise ValidationError(
+                {"attachment": _("An attachment is required for this leave request")}
+            )
+
+        # Overlapping leave check
+        if self.start_date and self.end_date:
+            overlapping_requests = self.leaveoverlapping().exclude(id=self.id)
+            if overlapping_requests.exclude(
+                status__in=["cancelled", "rejected"]
+            ).exists():
+                raise ValidationError(
+                    _("Employee already has a leave request for this date range.")
+                )
+
+        # Past date restriction
+        if (
+            not request.user.is_superuser
+            and EmployeePastLeaveRestrict.objects.filter(enabled=True).exists()
+        ):
+            restrict = EmployeePastLeaveRestrict.objects.first()
+            if restrict and self.start_date < date.today():
+                raise ValidationError(_("Requests cannot be made for past dates."))
+
+        # Avaialable leave days and requested leave days checking
+        available_leave = AvailableLeave.objects.get(
+            employee_id=self.employee_id, leave_type_id=leave_type
+        )
+        total_leave_days = (
+            available_leave.available_days + available_leave.carryforward_days
+        )
+        requested_days = calculate_requested_days(
+            self.start_date,
+            self.end_date,
+            self.start_date_breakdown,
+            self.end_date_breakdown,
+        )
+        effective_requested_days = cal_effective_requested_days(
+            start_date=self.start_date,
+            end_date=self.end_date,
+            leave_type_id=leave_type,
+            requested_days=requested_days,
+        )
+        leave_dates = leave_requested_dates(self.start_date, self.end_date)
+        month_year = [f"{date.year}-{date.strftime('%m')}" for date in leave_dates]
+        today = datetime.today()
+        unique_dates = list(set(month_year))
+        if f"{today.month}-{today.year}" in unique_dates:
+            unique_dates.remove(f"{today.strftime('%m')}-{today.year}")
+
+        forcated_days = available_leave.forcasted_leaves(self.start_date)
+        total_leave_days = (
+            available_leave.leave_type_id.carryforward_max
+            if available_leave.leave_type_id.carryforward_type
+            in ["carryforward", "carryforward expire"]
+            and available_leave.leave_type_id.carryforward_max < total_leave_days
+            else total_leave_days
+        )
+        if (
+            available_leave.leave_type_id.carryforward_type == "no carryforward"
+            and available_leave.carryforward_days
+        ):
+            total_leave_days = total_leave_days - available_leave.carryforward_days
+        total_leave_days += forcated_days
+        if not effective_requested_days <= total_leave_days:
+            raise ValidationError(
+                _("Does not have sufficient leave balance for the requested dates.")
+            )
+
+        # Get employee department and job if available
+        work_info = EmployeeWorkInformation.objects.filter(
+            employee_id=self.employee_id
+        ).first()
+        emp_dep = work_info.department_id if work_info else None
+        emp_job = work_info.job_position_id if work_info else None
+
+        # Skip further checks for superusers
+        if request.user.is_superuser:
+            return cleaned_data
+
+        # Restricted leave checks
+        for restrict in restricted_leaves:
+            exclued_types = set(restrict.exclued_leave_types.all())
+            specific_types = set(restrict.spesific_leave_types.all())
+
+            is_restricted = False
+
+            # Determine if the current leave type is restricted
+            if restrict.include_all and not exclued_types:
+                is_restricted = True
+            elif exclued_types and leave_type not in exclued_types:
+                is_restricted = True
+            elif leave_type in specific_types:
+                is_restricted = True
+
+            if not is_restricted:
+                continue
+
+            restri_days = set(restrict_leaves(restrict.id))
+            if not restri_days:
+                continue
+
+            # Check if requested days intersect with restricted days
+            if requ_days & restri_days:
                 if (
-                    restrict.include_all
-                    and len(restrict.exclued_leave_types.all()) == 0
-                ):
-                    restri_days = restrict_leaves(restri)
-
-                if restrict.exclued_leave_types.all():
-                    excluded = []
-                    for exclued in restrict.exclued_leave_types.all():
-                        excluded.append(exclued)
-                    if self.leave_type_id in excluded:
-                        pass
-                    else:
-                        restri_days = restrict_leaves(restri)
-
-                if restrict.spesific_leave_types.all():
-                    for spesific in restrict.spesific_leave_types.all():
-                        if str(spesific.name) == str(leave_type_instance):
-                            restri_days = restrict_leaves(restri)
-
-                if restri_days:
-                    if (
-                        restrict.department == emp_dep
-                        and len(restrict.job_position.all()) == 0
-                    ):
-
-                        # Check if any date in requ_days is present in restri_days
-                        if any(date in restri_days for date in requ_days):
-                            raise ValidationError(
-                                "You cannot request leave for this date range. The requestesd dates are restricted, Please contact admin."
-                            )
-                    elif restrict.job_position.all():
-                        if emp_job in restrict.job_position.all():
-                            if any(date in restri_days for date in requ_days):
-                                raise ValidationError(
-                                    "You cannot request leave for this date range. The requestesd dates are restricted, Please contact admin."
-                                )
+                    restrict.department == emp_dep
+                    and not restrict.job_position.exists()
+                ) or (emp_job and emp_job in restrict.job_position.all()):
+                    raise ValidationError(
+                        "You cannot request leave for this date range. The requested dates are restricted. Please contact admin."
+                    )
 
         return cleaned_data
 
@@ -1004,16 +1162,21 @@ class LeaverequestComment(HorillaModel):
 
 class LeaveAllocationRequest(HorillaModel):
     leave_type_id = models.ForeignKey(
-        LeaveType, on_delete=models.PROTECT, verbose_name="Leave type"
+        LeaveType, on_delete=models.PROTECT, verbose_name=_("Leave type")
     )
     employee_id = models.ForeignKey(
-        Employee, on_delete=models.CASCADE, verbose_name="Employee"
+        Employee, on_delete=models.CASCADE, verbose_name=_("Employee")
     )
-    requested_days = models.FloatField(blank=True, null=True)
+    requested_days = models.FloatField(
+        blank=True, null=True, verbose_name=_("Requested days")
+    )
     requested_date = models.DateField(default=timezone.now)
-    description = models.TextField(max_length=255)
+    description = models.TextField(max_length=255, verbose_name=_("Description"))
     attachment = models.FileField(
-        null=True, blank=True, upload_to="leave/leave_attachment"
+        null=True,
+        blank=True,
+        upload_to="leave/leave_attachment",
+        verbose_name=_("Attachment"),
     )
     status = models.CharField(
         max_length=30, choices=LEAVE_ALLOCATION_STATUS, default="requested"
@@ -1031,6 +1194,8 @@ class LeaveAllocationRequest(HorillaModel):
 
     class Meta:
         ordering = ["-id"]
+        verbose_name = _("Leave Allocation Request")
+        verbose_name_plural = _("Leave Allocation Requests")
 
     def __str__(self):
         return f"{self.employee_id}| {self.leave_type_id}| {self.id}"
@@ -1084,7 +1249,7 @@ class LeaveRequestConditionApproval(models.Model):
 
 
 class RestrictLeave(HorillaModel):
-    title = models.CharField(max_length=200)
+    title = models.CharField(max_length=200, verbose_name=_("Title"))
     start_date = models.DateField(verbose_name=_("Start Date"))
     end_date = models.DateField(verbose_name=_("End Date"))
     department = models.ForeignKey(
@@ -1099,18 +1264,20 @@ class RestrictLeave(HorillaModel):
         ),
     )
     include_all = models.BooleanField(
-        default=True, help_text=_("Enable to select all Leave types.")
+        default=True,
+        help_text=_("Enable to select all Leave types."),
+        verbose_name=_("Include All"),
     )
     spesific_leave_types = models.ManyToManyField(
         LeaveType,
-        verbose_name=_("Spesific leave types"),
+        verbose_name=_("Specific Leave Types"),
         related_name="spesific_leave_type",
         blank=True,
         help_text=_("Choose specific leave types to restrict."),
     )
     exclued_leave_types = models.ManyToManyField(
         LeaveType,
-        verbose_name=_("Exclude leave types"),
+        verbose_name=_("Exclude Leave Types"),
         related_name="excluded_leave_type",
         blank=True,
         help_text=_("Choose leave types to exclude from restriction."),
@@ -1242,93 +1409,94 @@ if apps.is_installed("attendance"):
         Class to override Attendance model save method
         """
 
+        pass
         # Additional fields and methods specific to AnotherModel
-        @receiver(pre_save, sender=LeaveRequest)
-        def leaverequest_pre_save(sender, instance, **_kwargs):
-            """
-            Overriding LeaveRequest model save method
-            """
-            WorkRecords = get_horilla_model_class(
-                app_label="attendance", model="workrecords"
-            )
-            if (
-                instance.start_date == instance.end_date
-                and instance.end_date_breakdown != instance.start_date_breakdown
-            ):
-                instance.end_date_breakdown = instance.start_date_breakdown
-                super(LeaveRequest, instance).save()
+        # @receiver(pre_save, sender=LeaveRequest)
+        # def leaverequest_pre_save(sender, instance, **_kwargs):
+        #     """
+        #     Overriding LeaveRequest model save method
+        #     """
+        #     WorkRecords = get_horilla_model_class(
+        #         app_label="attendance", model="workrecords"
+        #     )
+        #     if (
+        #         instance.start_date == instance.end_date
+        #         and instance.end_date_breakdown != instance.start_date_breakdown
+        #     ):
+        #         instance.end_date_breakdown = instance.start_date_breakdown
+        #         super(LeaveRequest, instance).save()
 
-            period_dates = get_date_range(instance.start_date, instance.end_date)
-            if instance.status == "approved":
-                for date in period_dates:
-                    try:
-                        work_entry = (
-                            WorkRecords.objects.filter(
-                                date=date,
-                                employee_id=instance.employee_id,
-                            )
-                            if WorkRecords.objects.filter(
-                                date=date,
-                                employee_id=instance.employee_id,
-                            ).exists()
-                            else WorkRecords()
-                        )
-                        work_entry.employee_id = instance.employee_id
-                        work_entry.is_leave_record = True
-                        work_entry.day_percentage = (
-                            0.50
-                            if instance.start_date == date
-                            and instance.start_date_breakdown == "first_half"
-                            or instance.end_date == date
-                            and instance.end_date_breakdown == "second_half"
-                            else 0.00
-                        )
-                        status = (
-                            "CONF"
-                            if instance.start_date == date
-                            and instance.start_date_breakdown == "first_half"
-                            or instance.end_date == date
-                            and instance.end_date_breakdown == "second_half"
-                            else "ABS"
-                        )
-                        work_entry.work_record_type = status
-                        work_entry.date = date
-                        work_entry.message = (
-                            "Absent"
-                            if status == "ABS"
-                            else _("Half day Attendance need to validate")
-                        )
-                        work_entry.save()
-                    except:
-                        pass
+        #     period_dates = get_date_range(instance.start_date, instance.end_date)
+        #     if instance.status == "approved":
+        #         for date in period_dates:
+        #             try:
+        #                 work_entry = (
+        #                     WorkRecords.objects.filter(
+        #                         date=date,
+        #                         employee_id=instance.employee_id,
+        #                     )
+        #                     if WorkRecords.objects.filter(
+        #                         date=date,
+        #                         employee_id=instance.employee_id,
+        #                     ).exists()
+        #                     else WorkRecords()
+        #                 )
+        #                 work_entry.employee_id = instance.employee_id
+        #                 work_entry.is_leave_record = True
+        #                 work_entry.day_percentage = (
+        #                     0.50
+        #                     if instance.start_date == date
+        #                     and instance.start_date_breakdown == "first_half"
+        #                     or instance.end_date == date
+        #                     and instance.end_date_breakdown == "second_half"
+        #                     else 0.00
+        #                 )
+        #                 status = (
+        #                     "CONF"
+        #                     if instance.start_date == date
+        #                     and instance.start_date_breakdown == "first_half"
+        #                     or instance.end_date == date
+        #                     and instance.end_date_breakdown == "second_half"
+        #                     else "ABS"
+        #                 )
+        #                 work_entry.work_record_type = status
+        #                 work_entry.date = date
+        #                 work_entry.message = (
+        #                     "Absent"
+        #                     if status == "ABS"
+        #                     else _("Half day Attendance need to validate")
+        #                 )
+        #                 work_entry.save()
+        #             except:
+        #                 pass
 
-            else:
-                for date in period_dates:
-                    WorkRecords.objects.filter(
-                        is_leave_record=True,
-                        date=date,
-                        employee_id=instance.employee_id,
-                    ).delete()
+        #     else:
+        #         for date in period_dates:
+        #             WorkRecords.objects.filter(
+        #                 is_leave_record=True,
+        #                 date=date,
+        #                 employee_id=instance.employee_id,
+        #             ).delete()
 
 
-@receiver(post_save, sender=LeaveRequest)
-def update_available(sender, instance, **kwargs):
-    """
-    post save method to update the available leaves
-    """
+# @receiver(post_save, sender=LeaveRequest)
+# def update_available(sender, instance, **kwargs):
+#     """
+#     post save method to update the available leaves
+#     """
 
-    _sender = sender
+#     _sender = sender
 
-    def update_leaves():
-        try:
-            if instance.leave_type_id:
-                available_leaves = instance.employee_id.available_leave.filter(
-                    leave_type_id=instance.leave_type_id
-                )
-                for assigned in available_leaves:
-                    assigned.save()
-        except Exception as e:
-            pass
+#     def update_leaves():
+#         try:
+#             if instance.leave_type_id:
+#                 available_leaves = instance.employee_id.available_leave.filter(
+#                     leave_type_id=instance.leave_type_id
+#                 )
+#                 for assigned in available_leaves:
+#                     assigned.save()
+#         except Exception as e:
+#             pass
 
-    thread = threading.Thread(target=update_leaves)
-    thread.start()
+#     thread = threading.Thread(target=update_leaves)
+#     thread.start()

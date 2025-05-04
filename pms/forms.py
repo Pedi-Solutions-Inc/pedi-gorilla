@@ -18,7 +18,7 @@ from django.template.loader import render_to_string
 from django.utils.translation import gettext_lazy as _
 
 from base.forms import ModelForm as BaseForm
-from base.forms import ModelForm as MF
+from base.forms import ModelForm as HorillaModelForm
 from base.methods import (
     filtersubordinatesemployeemodel,
     is_reportingmanager,
@@ -315,6 +315,16 @@ class EmployeeObjectiveCreateForm(BaseForm):
         queryset=Objective.objects.all().exclude(archive=True),
         required=True,
         label=_("Objective"),
+        widget=forms.Select(
+            attrs={
+                "hx-include": "#empObjectiveCreateForm",
+                "hx-target": "#id_key_result_id_parent_div",
+                "hx-select": "#id_key_result_id_parent_div",
+                "hx-swap": "outerHTML",
+                "hx-trigger": "change",
+                "hx-get": "/pms/get-objective-keyresult",
+            }
+        ),
     )
 
     class Meta:
@@ -341,7 +351,7 @@ class EmployeeObjectiveCreateForm(BaseForm):
         super().__init__(*args, **kwargs)
         request = getattr(horilla_middlewares._thread_locals, "request", None)
 
-        if request.user.has_perm("pms.add_keyresult") or is_reportingmanager(request):
+        if request.user.has_perm("pms.add_keyresult"):
             self.fields["key_result_id"].choices = list(
                 self.fields["key_result_id"].choices
             )
@@ -447,10 +457,7 @@ class EmployeeKeyResultForm(BaseForm):
             )
 
 
-from base.forms import ModelForm as MF
-
-
-class KRForm(MF):
+class KRForm(HorillaModelForm):
     """
     A form used for creating KeyResult object
     """
@@ -661,28 +668,20 @@ class KeyResultForm(ModelForm):
         return cleaned_data
 
 
-class FeedbackForm(ModelForm):
+class FeedbackForm(HorillaModelForm):
     """
-    A form used for creating and updating Feedback objects.
+    FeedbackForm for better performance.
     """
 
     period = forms.ModelChoiceField(
-        queryset=Period.objects.all(),
+        queryset=Period.objects.none(),
+        label=_("Period"),
         empty_label="",
-        widget=forms.Select(
-            attrs={
-                "class": " oh-select--period-change ",
-                "style": "width:100%;",
-            }
-        ),
+        widget=forms.Select(attrs={"class": "oh-select--period-change"}),
         required=False,
     )
 
     class Meta:
-        """
-        A nested class that specifies the model,fields and exclude fields for the form.
-        """
-
         model = Feedback
         fields = "__all__"
         exclude = ["status", "archive", "is_active"]
@@ -692,45 +691,10 @@ class FeedbackForm(ModelForm):
                 attrs={"placeholder": _("Enter a title"), "class": "oh-input w-100"}
             ),
             "start_date": forms.DateInput(
-                attrs={"type": "date", "class": "oh-input  w-100"}
+                attrs={"type": "date", "class": "oh-input w-100"}
             ),
             "end_date": forms.DateInput(
-                attrs={"type": "date", "class": "oh-input  w-100"}
-            ),
-            "employee_id": forms.Select(
-                attrs={
-                    "class": "oh-select oh-select-2",
-                    "required": "false",
-                },
-            ),
-            "manager_id": forms.Select(
-                attrs={
-                    "class": "oh-select oh-select-2 ",
-                    "style": "width:100%;",
-                    "required": "true",
-                },
-            ),
-            "colleague_id": forms.SelectMultiple(
-                attrs={
-                    "class": "oh-select oh-select-2 w-100",
-                    "multiple": "multiple",
-                    "style": "width:100%;",
-                }
-            ),
-            "subordinate_id": forms.SelectMultiple(
-                attrs={
-                    "class": "oh-select oh-select-2 w-100",
-                    "multiple": "multiple",
-                    "style": "width:100%;",
-                    "required": "false",
-                }
-            ),
-            "question_template_id": forms.Select(
-                attrs={
-                    "class": "oh-select oh-select--lg oh-select-no-search",
-                    "style": "width:100%;",
-                    "required": "true",
-                }
+                attrs={"type": "date", "class": "oh-input w-100"}
             ),
             "cyclic_feedback": forms.CheckboxInput(
                 attrs={
@@ -738,77 +702,85 @@ class FeedbackForm(ModelForm):
                     "onchange": "changeCyclicFeedback(this)",
                 }
             ),
-            "cyclic_feedback_period": forms.Select(
-                attrs={
-                    "class": "oh-select oh-select--lg oh-select-no-search",
-                    "style": "width:100%;",
-                }
-            ),
-            "cyclic_feedback_days_count": forms.NumberInput(
-                attrs={
-                    "class": "oh-input",
-                }
-            ),
         }
 
     def __init__(self, *args, **kwargs):
         """
-        Initializes the feedback form instance.
-        If an instance is provided, sets the initial value for the form's date fields.
+        Initializes the form and queryset filtering.
         """
-        # fetch request
         request = getattr(horilla_middlewares._thread_locals, "request", None)
-        # get instance
-        instance = kwargs.get("instance")
-        # set employee
-        if instance:
-            employee = instance.employee_id
-        else:
-            employee = request.user.employee_get
-
-        if not instance:
-            today = datetime.datetime.today().date()
-            kwargs["initial"] = {"start_date": today, "end_date": today}
-
         super().__init__(*args, **kwargs)
 
-        # Horilla multi select filter for employee
-        self.fields["subordinate_id"] = HorillaMultiSelectField(
-            queryset=Employee.objects.all(),
-            widget=HorillaMultiSelectWidget(
-                filter_route_name="employee-widget-filter",
-                filter_class=EmployeeFilter,
-                filter_instance_contex_name="f",
-                filter_template_path="employee_filters.html",
-                instance=self.instance,
-                required=False,
-            ),
-            label="Subordinates",
+        user = request.user if request else None
+        user_perms = user.get_all_permissions() if user else set()
+
+        self.fields["period"].queryset = Period.objects.all()
+        self.fields["period"].widget.attrs.update({"class": "w-100"})
+
+        if user and ("pms.add_period" in user_perms or is_reportingmanager(request)):
+            self.fields["period"].choices = [
+                *self.fields["period"].choices,
+                ("create_new_period", "Create new period"),
+            ]
+
+        employee_queryset = Employee.objects.none()
+        if user and ("pms.add_feedback" in user_perms or is_reportingmanager(request)):
+            employee_queryset = filtersubordinatesemployeemodel(
+                request,
+                Employee.objects.all(),
+                perm="pms.add_feedback",
+            )
+
+        self.fields["employee_id"].queryset = (
+            employee_queryset | Employee.objects.filter(employee_user_id=request.user)
         )
+        self.fields["employee_id"].widget.attrs["onchange"] = "get_collegues($(this))"
+
         reload_queryset(self.fields)
 
-        # check the request user has permission to add period
-        if request.user.has_perm("pms.add_period") or is_reportingmanager(request):
-            # add dyanamic period creation as choice
-            self.fields["period"].choices = list(self.fields["period"].choices)
-            self.fields["period"].choices.append(
-                ("create_new_period", "Create new period")
+        if self.instance and self.instance.pk:
+            employee = self.instance.employee_id
+            reporting_manager = (
+                getattr(employee.employee_work_info, "reporting_manager_id", None)
+                if employee
+                and hasattr(employee, "employee_work_info")
+                and employee.employee_work_info
+                else None
             )
-        # add onchange function to get employee data
-        self.fields["employee_id"].widget.attrs.update(
-            {"onchange": "get_collegues($(this))"}
-        )
-        # filtering employees accordig to the request user
-        if request.user.has_perm("pms.add_feedback") or is_reportingmanager(request):
-            # Queryset of subordinate employees
-            employees = filtersubordinatesemployeemodel(
-                request, Employee.objects.all(), perm="pms.add_feedback"
+            subordinates = Employee.objects.filter(
+                is_active=True, employee_work_info__reporting_manager_id=employee
             )
-            self.fields["employee_id"].queryset = employees | Employee.objects.filter(
-                employee_user_id=request.user
+            department = employee.get_department()
+
+            exclude_ids = [employee.id]
+            if reporting_manager:
+                exclude_ids.append(reporting_manager.id)
+
+            colleagues = Employee.objects.filter(
+                is_active=True, employee_work_info__department_id=department
+            ).exclude(id__in=exclude_ids)
+
+            self.fields["colleague_id"].queryset = colleagues
+            self.fields["subordinate_id"].queryset = subordinates
+            self.fields["manager_id"].queryset = (
+                Employee.objects.filter(id=reporting_manager.id)
+                if reporting_manager
+                else Employee.objects.none()
             )
-            if not instance:
-                self.fields["employee_id"].initial = employee
+
+        # # Horilla multi-select filter for subordinates
+        # self.fields["subordinate_id"] = HorillaMultiSelectField(
+        #     queryset=Employee.objects.all(),
+        #     widget=HorillaMultiSelectWidget(
+        #         filter_route_name="employee-widget-filter",
+        #         filter_class=EmployeeFilter,
+        #         filter_instance_contex_name="f",
+        #         filter_template_path="employee_filters.html",
+        #         instance=self.instance,
+        #         required=False,
+        #     ),
+        #     label=_("Subordinates"),
+        # )
 
     def clean(self):
         """
@@ -1119,7 +1091,7 @@ class MeetingsForm(BaseForm):
             pass
 
 
-class BonusPointSettingForm(MF):
+class BonusPointSettingForm(HorillaModelForm):
     """
     BonusPointSetting form
     """
@@ -1165,7 +1137,7 @@ class BonusPointSettingForm(MF):
         return cleaned_data
 
 
-class EmployeeBonusPointForm(MF):
+class EmployeeBonusPointForm(HorillaModelForm):
     """
     EmployeeBonusPoint form
     """
@@ -1183,3 +1155,49 @@ class EmployeeBonusPointForm(MF):
             if employee:
                 self.fields["employee_id"].queryset = employee
                 self.initial["employee_id"] = employee.first()
+
+    def clean(self):
+        cleaned_data = super().clean()
+        bonus_point = cleaned_data.get("bonus_point")
+        if bonus_point <= 0:
+            raise forms.ValidationError(
+                {"bonus_point": _("Point should be greater than zero.")}
+            )
+        return cleaned_data
+
+
+class EmployeeFeedbackForm(HorillaModelForm):
+
+    cols = {"others_id": 12}
+
+    class Meta:
+        model = Feedback
+        fields = ["others_id"]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["others_id"] = HorillaMultiSelectField(
+            queryset=Employee.objects.filter(employee_work_info__isnull=False),
+            widget=HorillaMultiSelectWidget(
+                filter_route_name="employee-widget-filter",
+                filter_class=EmployeeFilter,
+                filter_instance_contex_name="f",
+                filter_template_path="employee_filters.html",
+                form=self,
+                instance=self.instance,
+            ),
+            label=_("Employees"),
+        )
+
+    def clean(self):
+        cleaned_data = super().clean()
+        if isinstance(self.fields["others_id"], HorillaMultiSelectField):
+            self.errors.pop("others_id", None)
+
+            employee_data = self.fields["others_id"].queryset.filter(
+                id__in=self.data.getlist("others_id")
+            )
+
+            cleaned_data["others_id"] = employee_data
+
+        return cleaned_data

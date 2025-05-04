@@ -1,7 +1,7 @@
 from rest_framework import serializers
 
 from employee.models import Employee
-from leave.forms import cal_effective_requested_days, calculate_requested_days
+from leave.methods import calculate_requested_days
 from leave.models import *
 
 
@@ -460,13 +460,13 @@ class LeaveAllocationRequestGetSerializer(serializers.ModelSerializer):
 
 class CompanyLeaveSerializer(serializers.ModelSerializer):
     class Meta:
-        model = CompanyLeave
+        model = CompanyLeaves
         exclude = ["company_id"]
 
 
 class HoildaySerializer(serializers.ModelSerializer):
     class Meta:
-        model = Holiday
+        model = Holidays
         exclude = ["company_id"]
 
     def validate(self, data):
