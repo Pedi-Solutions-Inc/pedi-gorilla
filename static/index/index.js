@@ -32,12 +32,29 @@ function getCookie(name) {
     return cookieValue;
 }
 
+function handleSidebarToggle() {
+    // Delay the execution slightly to allow existing toggle logic to finish
+    setTimeout(() => {
+        const isOpen = !$('.oh-wrapper-main').hasClass('oh-wrapper-main--closed');
+        localStorage.setItem('sidebarOpen', isOpen);
+    }, 50);
+}
+
 function addToSelectedId(newIds, storeKey) {
     ids = JSON.parse($(`#${storeKey}`).attr("data-ids") || "[]");
 
     ids = [...ids, ...newIds.map(String)];
     ids = Array.from(new Set(ids));
     $(`#${storeKey}`).attr("data-ids", JSON.stringify(ids));
+}
+
+function togglePublicComments() {
+    if ($('#id_disable_comments').is(':checked')) {
+        $('#id_public_comments').prop('checked', false);
+        $('#id_public_comments_parent_div').hide();
+    } else {
+        $('#id_public_comments_parent_div').show();
+    }
 }
 
 function attendanceDateChange(selectElement) {
@@ -324,7 +341,7 @@ function checkSequence(element) {
 
     if (
         stageOrder.indexOf(parseInt(stageId)) !=
-            stageOrder.indexOf(parseInt(preStageId)) + 1 &&
+        stageOrder.indexOf(parseInt(preStageId)) + 1 &&
         stage.type != "cancelled"
     ) {
         Swal.fire({
@@ -537,27 +554,28 @@ window.confirm = function (message) {
             });
             if (event.target.tagName.toLowerCase() === "form") {
                 if (path && verb) {
-                    if (verb === "post") {
-                        htmx.ajax("POST", path, {
-                            target: hxTarget,
-                            swap: hxSwap,
-                            values: hxVals,
-                        }).then((response) => {
-                            ajaxWithResponseHandler(event);
-                        });
-                    } else {
-                        htmx.ajax("GET", path, {
-                            target: hxTarget,
-                            swap: hxSwap,
-                            values: hxVals,
-                        }).then((response) => {
-                            ajaxWithResponseHandler(event);
-                        });
-                    }
+                    // Collect all form values
+                    const formData = new FormData(event.target);
+                    const values = {};
+                    formData.forEach((value, key) => {
+                        values[key] = value;
+                    });
+
+                    // Merge with hx-vals, if any
+                    Object.assign(values, hxVals);
+
+                    htmx.ajax(verb.toUpperCase(), path, {
+                        target: hxTarget,
+                        swap: hxSwap,
+                        values: values,
+                    }).then((response) => {
+                        ajaxWithResponseHandler(event);
+                    });
                 } else {
-                    event.target.submit();
+                    event.target.submit();  // fallback
                 }
-            } else if (event.target.tagName.toLowerCase() === "a") {
+            }
+            else if (event.target.tagName.toLowerCase() === "a") {
                 if (event.target.href) {
                     window.location.href = event.target.href;
                 } else {
@@ -627,6 +645,34 @@ nav.after(
     )
 );
 
+$(function () {
+    const $wrapper = $('.oh-wrapper-main');
+    const sidebarOpen = localStorage.getItem('sidebarOpen');
+
+    if (sidebarOpen === 'false') {
+        $wrapper.addClass('oh-wrapper-main--closed');
+    } else {
+        $wrapper.removeClass('oh-wrapper-main--closed');
+    }
+
+    $('#sidebar').on('mouseleave', () => {
+        if (localStorage.getItem('sidebarOpen') === 'false') {
+            $wrapper.addClass('oh-wrapper-main--closed');
+        }
+    });
+});
+
+$(document).on('click', '.oh-kanban__card-body-collapse', function (e) {
+    e.preventDefault();
+
+    var $cardBody = $(this).closest('.oh-kanban__card-body');
+
+    $cardBody.find('.oh-kanban__card-content').toggleClass('oh-kanban__card-content--hide');
+
+    $(this).toggleClass('oh-kanban__card-collapse--down');
+});
+
+
 $(document).on("htmx:beforeRequest", function (event, data) {
     if (
         !Array.from(event.target.getAttributeNames()).some((attr) =>
@@ -639,6 +685,7 @@ $(document).on("htmx:beforeRequest", function (event, data) {
             "BiometricDeviceTestFormTarget",
             "reloadMessages",
             "infinite",
+            "OtpContainer"
         ];
         var avoid_target_class = ["oh-badge--small"];
         if (

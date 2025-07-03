@@ -37,6 +37,7 @@ setattr(QuerySet, "from_list", from_list)
 
 SIGNAL_HANDLERS = []
 INSTANCE_HANDLERS = []
+REFRESH_METHODS = {}
 
 
 def start_automation():
@@ -73,6 +74,8 @@ def start_automation():
             post_save.disconnect(handler, sender=handler.model_class)
             post_bulk_update.disconnect(handler, sender=handler.model_class)
         SIGNAL_HANDLERS.clear()
+
+    REFRESH_METHODS["clear_connection"] = clear_connection
 
     def create_post_bulk_update_handler(automation, model_class, query_strings):
         def post_bulk_update_handler(sender, queryset, *args, **kwargs):
@@ -184,6 +187,8 @@ def start_automation():
             post_save.connect(
                 dynamic_signal_handler, sender=dynamic_signal_handler.model_class
             )
+
+    REFRESH_METHODS["start_connection"] = start_connection
 
     def create_pre_bulk_update_handler(automation, model_class):
         def pre_bulk_update_handler(sender, queryset, *args, **kwargs):
@@ -356,7 +361,7 @@ def send_mail(request, automation, instance):
 
     mail_template = automation.mail_template
     employees = []
-    raw_emails = []
+    to_emails = []
 
     if instance.pk:
         # refreshing instance due to m2m fields are not loading here some times
@@ -373,15 +378,15 @@ def send_mail(request, automation, instance):
     for mapping in eval_validate(automation.mail_to):
         result = getattribute(instance, mapping)
         if isinstance(result, list):
-            raw_emails.extend(result)
+            to_emails.extend(result)
         else:
-            raw_emails.append(result)
+            to_emails.append(result)
 
-    raw_emails = list(filter(None, set(raw_emails)))
+    to_emails = list(filter(None, set(to_emails)))
 
     employees = Employee.objects.filter(
-        models.Q(email__in=raw_emails)
-        | models.Q(employee_work_info__email__in=raw_emails)
+        models.Q(email__in=to_emails)
+        | models.Q(employee_work_info__email__in=to_emails)
     ).select_related("employee_work_info")
 
     employees = list(employees)
@@ -394,11 +399,11 @@ def send_mail(request, automation, instance):
     except Exception as e:
         logger.error(e)
 
-    emails = [str(emp.get_mail()) for emp in employees if emp and emp.get_mail()]
+    cc_emails = [str(emp.get_mail()) for emp in also_sent_to if emp and emp.get_mail()]
     user_ids = [emp.employee_user_id for emp in employees]
 
-    to = emails[:1]
-    cc = emails[1:]
+    to = to_emails
+    cc = cc_emails
 
     email_backend = ConfiguredEmailBackend()
     display_email_name = email_backend.dynamic_from_email_with_display_name
@@ -410,7 +415,7 @@ def send_mail(request, automation, instance):
         except:
             logger.error(Exception)
 
-    if pk_or_text and request and raw_emails:
+    if pk_or_text and request and to_emails:
         attachments = []
         try:
             sender = request.user.employee_get
@@ -425,6 +430,7 @@ def send_mail(request, automation, instance):
                             "instance": context_instance,
                             "self": sender,
                             "model_instance": instance,
+                            "request": request,
                         }
                     )
                     render_bdy = template_bdy.render(context)
@@ -442,12 +448,19 @@ def send_mail(request, automation, instance):
         else:
             template_bdy = template.Template(pk_or_text)
         context = template.Context(
-            {"instance": context_instance, "self": sender, "model_instance": instance}
+            {
+                "instance": context_instance,
+                "self": sender,
+                "model_instance": instance,
+                "request": request,
+            }
         )
         render_bdy = template_bdy.render(context)
 
         title_template = template.Template(automation.title)
-        title_context = template.Context({"instance": instance, "self": sender})
+        title_context = template.Context(
+            {"instance": instance, "self": sender, "request": request}
+        )
         render_title = title_template.render(title_context)
         soup = BeautifulSoup(render_bdy, "html.parser")
         plain_text = soup.get_text(separator="\n")
@@ -467,6 +480,9 @@ def send_mail(request, automation, instance):
         def _send_mail(email):
             try:
                 email.send()
+                logger.info(
+                    f"Automation <Mail> {automation.title} is triggered by {request.user.employee_get}"
+                )
             except Exception as e:
                 logger.error(e)
 
@@ -478,15 +494,21 @@ def send_mail(request, automation, instance):
                 icon="person-remove",
                 redirect="",
             )
+            logger.info(
+                f"Automation <Notification> {automation.title} is triggered by {request.user.employee_get}"
+            )
 
-        if automation.delivary_channel != "notification":
+        if automation.delivery_channel != "notification":
             thread = threading.Thread(
                 target=lambda: _send_mail(email),
             )
             thread.start()
 
-        if automation.delivary_channel != "email":
+        if automation.delivery_channel != "email":
             thread = threading.Thread(
                 target=lambda: _send_notification(plain_text),
             )
             thread.start()
+        logger.info(
+            f"Automation Triggered | {automation.get_delivery_channel_display()} | {automation}"
+        )

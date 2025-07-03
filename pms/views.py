@@ -742,6 +742,14 @@ def objective_detailed_view(request, obj_id, **kwargs):
     emp_objectives = EmployeeObjective.objects.filter(
         objective_id=objective, archive=False
     )
+    if not (
+        request.user.employee_get in objective.managers.all()
+        or request.user.has_perm("pms.view_employeeobjective")
+        or emp_objectives.filter(employee_id=request.user.employee_get).exists()
+    ):
+        messages.info(request, _("You dont have permission."))
+        return redirect("objective-list-view")
+
     previous_data = request.GET.urlencode()
     data_dict = parse_qs(previous_data)
     now = datetime.datetime.now()
@@ -1201,11 +1209,18 @@ def change_employee_objective_status(request):
     emp_obj = request.GET.get("empObjId")
     emp_objective = EmployeeObjective.objects.filter(id=emp_obj).first()
     status = request.GET.get("status")
-    if (
-        request.user.has_perm("pms.change_employeeobjective")
-        or emp_objective.employee_id == request.user.employee_get
+    if not (
+        request.user.has_perm("pms.change_objective")
+        or request.user.has_perm("pms.change_employeeobjective")
+        or request.user.has_perm("pms.change_employeekeyresult")
         or request.user.employee_get in emp_objective.objective_id.managers.all()
+        or (
+            emp_objective.objective_id.self_employee_progress_update
+            and (emp_objective.employee_id == request.user.employee_get)
+        )
     ):
+        messages.info(request, _("You dont have permission."))
+    else:
         if emp_objective.status != status:
             emp_objective.status = status
             emp_objective.save()
@@ -1238,9 +1253,6 @@ def change_employee_objective_status(request):
             messages.info(
                 request, _("The status of the objective is the same as selected.")
             )
-
-    else:
-        messages.info(request, _("You dont have permission."))
     return HttpResponse("<script>$('#reloadMessagesButton').click();</script>")
 
 
@@ -1422,10 +1434,10 @@ def key_result_update(request, id):
 
 
 # feedback section
-def send_feedback_notifications(request, form):
+def send_feedback_notifications(request, feedback):
     # Send notification to employee
-    if form.employee_id:
-        employee = form.employee_id
+    if feedback.employee_id:
+        employee = feedback.employee_id
         notify.send(
             request.user.employee_get,
             recipient=employee.employee_user_id,
@@ -1434,56 +1446,22 @@ def send_feedback_notifications(request, form):
             verb_de="Sie haben Feedback erhalten!",
             verb_es="¡Has recibido retroalimentación!",
             verb_fr="Vous avez reçu des commentaires !",
-            redirect=reverse("feedback-detailed-view", kwargs={"id": form.id}),
+            redirect=reverse("feedback-detailed-view", kwargs={"id": feedback.id}),
             icon="chatbox-ellipses",
         )
-
-    # Send notification to manager
-    if form.manager_id:
-        manager = form.manager_id
+    all_employees = feedback.requested_employees()
+    for employee in all_employees:
         notify.send(
             request.user.employee_get,
-            recipient=manager.employee_user_id,
-            verb="You have been assigned as a manager in a feedback!",
-            verb_ar="لقد تم تعيينك كمدير في ملاحظة!",
-            verb_de="Sie wurden als Manager in einem Feedback zugewiesen!",
-            verb_es="¡Has sido asignado como manager en un feedback!",
-            verb_fr="Vous avez été désigné comme manager dans un commentaire !",
-            redirect=reverse("feedback-detailed-view", kwargs={"id": form.id}),
+            recipient=employee.employee_user_id,
+            verb="You have been requested to provide feedback!",
+            verb_ar="لقد طُلب منك تقديم ملاحظات!",
+            verb_de="Sie wurden gebeten, Feedback zu geben!",
+            verb_es="Se le ha solicitado que proporcione comentarios.",
+            verb_fr="Il vous a été demandé de fournir des commentaires.",
+            redirect=reverse("feedback-detailed-view", kwargs={"id": feedback.id}),
             icon="chatbox-ellipses",
         )
-
-    # Send notification to subordinates
-    if form.subordinate_id:
-        subordinates = form.subordinate_id.all()
-        for subordinate in subordinates:
-            notify.send(
-                request.user.employee_get,
-                recipient=subordinate.employee_user_id,
-                verb="You have been assigned as a subordinate in a feedback!",
-                verb_ar="لقد تم تعيينك كمرؤوس في ملاحظة!",
-                verb_de="Sie wurden als Untergebener in einem Feedback zugewiesen!",
-                verb_es="¡Has sido asignado como subordinado en un feedback!",
-                verb_fr="Vous avez été désigné comme subordonné dans un commentaire !",
-                redirect=reverse("feedback-detailed-view", kwargs={"id": form.id}),
-                icon="chatbox-ellipses",
-            )
-
-    # Send notification to colleagues
-    if form.colleague_id:
-        colleagues = form.colleague_id.all()
-        for colleague in colleagues:
-            notify.send(
-                request.user.employee_get,
-                recipient=colleague.employee_user_id,
-                verb="You have been assigned as a colleague in a feedback!",
-                verb_ar="لقد تم تعيينك كزميل في ملاحظة!",
-                verb_de="Sie wurden als Kollege in einem Feedback zugewiesen!",
-                verb_es="¡Has sido asignado como colega en un feedback!",
-                verb_fr="Vous avez été désigné comme collègue dans un commentaire !",
-                redirect=reverse("feedback-detailed-view", kwargs={"id": form.id}),
-                icon="chatbox-ellipses",
-            )
 
 
 @login_required
@@ -1513,7 +1491,7 @@ def feedback_creation(request):
             instance.subordinate_id.set(employees)
 
             messages.success(request, _("Feedback created successfully."))
-            send_feedback_notifications(request, form=instance)
+            send_feedback_notifications(request, feedback=instance)
             return redirect(feedback_list_view)
         else:
             context["feedback_form"] = form
@@ -1593,15 +1571,15 @@ def feedback_update(request, id):
                     ).first()
                     feedback_form = form.save()
                     feedback_form.employee_key_results_id.add(key_result)
-            instance = form.save(commit=False)
+            instance = form.save()
             instance.subordinate_id.set(employees)
             other_employees = check_duplication(
                 form.instance, form.instance.others_id.all()
             )
             form.cleaned_data["others_id"] = other_employees
-            form = form.save()
+            feedback = form.save()
             messages.info(request, _("Feedback updated successfully!."))
-            send_feedback_notifications(request, form)
+            send_feedback_notifications(request, feedback)
             response = render(request, "feedback/feedback_update.html", context)
             return HttpResponse(
                 response.content.decode("utf-8") + "<script>location.reload();</script>"
@@ -3325,11 +3303,26 @@ def key_result_current_value_update(request):
         current_value = eval_validate(request.POST.get("current_value"))
         emp_kr_id = eval_validate(request.POST.get("emp_key_result_id"))
         emp_kr = EmployeeKeyResult.objects.get(id=emp_kr_id)
-        if current_value <= emp_kr.target_value:
+        if (
+            request.user.has_perm("pms.change_objective")
+            or request.user.has_perm("pms.change_employeeobjective")
+            or request.user.has_perm("pms.change_employeekeyresult")
+            or request.user.employee_get
+            in emp_kr.employee_objective_id.objective_id.managers.all()
+            or (
+                emp_kr.employee_objective_id.objective_id.self_employee_progress_update
+                and (
+                    emp_kr.employee_objective_id.employee_id
+                    == request.user.employee_get
+                )
+            )
+        ):
             emp_kr.current_value = current_value
             emp_kr.save()
             emp_kr.employee_objective_id.update_objective_progress()
             return JsonResponse({"type": "sucess"})
+        else:
+            messages.info(request, "You dont have permission")
     except:
         return JsonResponse({"type": "error"})
 
@@ -3787,9 +3780,10 @@ def dashboard_feedback_answer(request):
     ).distinct()
     feedbacks = feedback_requested.exclude(feedback_answer__employee_id=employee)
     feedbacks = paginator_qry(feedbacks, page_number)
+
     return render(
         request,
-        "request_and_approve/feedback_answer.html",
+        "dashboard/feedback_answer.html",
         {
             "feedbacks": feedbacks,
             "pd": previous_data,
